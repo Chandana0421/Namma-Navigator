@@ -79,26 +79,36 @@ class SuperEfficientDataFusionAgent:
         return True
     
     def intelligent_data_ingestion(self):
-        """Fetch and pre-filter high-signal data"""
+        """Fetch and pre-filter high-signal data with detailed logging"""
         print("🔍 Intelligent data ingestion starting...")
+        print("="*60)
         
         high_signal_posts = []
+        total_posts_scanned = 0
+        posts_by_subreddit = {}
         
         # Target high-activity Bengaluru subreddits
         target_subreddits = ['bangalore', 'bengaluru', 'india']
         
         for subreddit_name in target_subreddits:
+            print(f"\n📡 Scanning r/{subreddit_name}...")
+            subreddit_posts = []
+            
             try:
                 subreddit = self.reddit.subreddit(subreddit_name)
                 
                 # Get both hot and new posts for comprehensive coverage
                 post_sources = [
-                    subreddit.hot(limit=30),
-                    subreddit.new(limit=20)
+                    ("HOT", subreddit.hot(limit=30)),
+                    ("NEW", subreddit.new(limit=20))
                 ]
                 
-                for post_source in post_sources:
+                for source_type, post_source in post_sources:
+                    print(f"  🔥 Fetching {source_type} posts from r/{subreddit_name}...")
+                    
                     for post in post_source:
+                        total_posts_scanned += 1
+                        
                         # Pre-filter for Bengaluru relevance
                         if self._is_high_signal_content(post):
                             post_data = {
@@ -112,18 +122,48 @@ class SuperEfficientDataFusionAgent:
                                 'num_comments': post.num_comments,
                                 'category_hint': self._quick_categorize(post.title + " " + post.selftext),
                                 'priority_score': self._calculate_priority(post),
-                                'timestamp': datetime.now().isoformat()
+                                'timestamp': datetime.now().isoformat(),
+                                'source_type': source_type
                             }
+                            
+                            # Print details about selected post
+                            print(f"    ✅ SELECTED: [{post_data['category_hint'].upper()}] {post.title[:50]}...")
+                            print(f"       📊 Score: {post.score} | Comments: {post.num_comments} | Priority: {post_data['priority_score']:.1f}")
+                            print(f"       🕒 Source: {source_type} from r/{subreddit_name}")
+                            
                             high_signal_posts.append(post_data)
+                            subreddit_posts.append(post_data)
+                        else:
+                            # Optionally show rejected posts (comment out if too verbose)
+                            # print(f"    ❌ REJECTED: {post.title[:40]}...")
+                            pass
                             
             except Exception as e:
                 print(f"⚠️ Error fetching r/{subreddit_name}: {e}")
+            
+            posts_by_subreddit[subreddit_name] = len(subreddit_posts)
+            print(f"  📈 Found {len(subreddit_posts)} relevant posts in r/{subreddit_name}")
         
         # Sort by priority for intelligent processing
         high_signal_posts.sort(key=lambda x: x['priority_score'], reverse=True)
         
-        print(f"✅ Collected {len(high_signal_posts)} high-signal posts")
+        # Summary statistics
+        print(f"\n📊 INGESTION SUMMARY:")
+        print(f"  🔍 Total posts scanned: {total_posts_scanned}")
+        print(f"  ✅ High-signal posts found: {len(high_signal_posts)}")
+        print(f"  📈 Success rate: {(len(high_signal_posts)/total_posts_scanned)*100:.1f}%")
+        
+        print(f"\n📋 POSTS BY SUBREDDIT:")
+        for subreddit, count in posts_by_subreddit.items():
+            print(f"  r/{subreddit}: {count} posts")
+        
+        print(f"\n🎯 TOP 10 PRIORITY POSTS:")
+        for i, post in enumerate(high_signal_posts[:10]):
+            print(f"  {i+1}. [{post['category_hint'].upper()}] {post['title'][:50]}...")
+            print(f"     Priority: {post['priority_score']:.1f} | r/{post['subreddit']} | {post['source_type']}")
+        
         return high_signal_posts[:50]  # Top 50 for efficiency
+
     
     def _is_high_signal_content(self, post) -> bool:
         """Advanced signal detection with detailed logging"""
@@ -318,6 +358,7 @@ class SuperEfficientDataFusionAgent:
         except Exception as e:
             print(f"  ⚠️ Gemini API error: {e} - using fallback")
             return self._fallback_processing(posts, category)
+
     
     def _fallback_processing(self, posts: List[Dict], category: str) -> List[Dict]:
         """Fallback processing when API fails"""

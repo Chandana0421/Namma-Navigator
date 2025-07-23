@@ -1,7 +1,10 @@
+# tests/test_super_system.py
 import time
 from src.data_fusion_agent import SuperEfficientDataFusionAgent
 
 def test_complete_system():
+    """Test the complete super-efficient system"""
+    print("🧪 TESTING SUPER-EFFICIENT NAMMA NAVIGATOR...")
     
     agent = SuperEfficientDataFusionAgent()
     
