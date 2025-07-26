@@ -1,472 +1,397 @@
+from google.agent import Agent, Tool, Workflow, Context
 import os
 import json
 import time
 import hashlib
+import re
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 import google.generativeai as genai
+import google.api_core.exceptions as google_exceptions
 import praw
-import requests
-from geopy.geocoders import Nominatim
-import firebase_admin  # Add this line
-from firebase_admin import credentials, firestore  # Add this line
+import firebase_admin
+from firebase_admin import credentials, firestore
 from dotenv import load_dotenv
+import functools
+import random
 
 load_dotenv('config/.env')
 
-class SuperEfficientDataFusionAgent:
-    def __init__(self):
-        # Initialize Firebase
-        if not firebase_admin._apps:
-            cred = credentials.Certificate('config/firebase-service-account.json')
-            firebase_admin.initialize_app(cred)
-        
-        self.db = firestore.client()
-        
-        # Initialize Gemini with rate limiting
-        genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
-        self.model = genai.GenerativeModel('gemini-1.5-flash-latest')
-        
-        # Smart rate limiter for efficiency
-        self.last_api_call = 0
-        self.api_calls_today = 0
-        self.daily_limit = 250
-        
-        # Initialize Reddit
-        self.reddit = praw.Reddit(
-            client_id=os.getenv('REDDIT_CLIENT_ID'),
-            client_secret=os.getenv('REDDIT_CLIENT_SECRET'),
-            user_agent=os.getenv('REDDIT_USER_AGENT')
-        )
-        
-        # Bengaluru intelligence keywords
-        self.bengaluru_signals = {
-            'traffic': ['traffic', 'jam', 'road', 'signal', 'blocked', 'accident', 'stuck'],
-            'infrastructure': ['pothole', 'construction', 'metro', 'water', 'power cut', 'outage'],
-            'weather': ['rain', 'flood', 'waterlogged', 'storm', 'weather'],
-            'events': ['protest', 'rally', 'festival', 'event', 'crowd', 'gathering'],
-            'civic': ['garbage', 'complaint', 'bbmp', 'civic', 'municipal']
-        }
-        
-        # Location intelligence
-        self.bengaluru_areas = [
-            'koramangala', 'indiranagar', 'whitefield', 'electronic city',
-            'hsr layout', 'jayanagar', 'malleshwaram', 'rajajinagar',
-            'hebbal', 'sarjapur', 'marathahalli', 'btm layout',
-            'mg road', 'brigade road', 'commercial street', 'silk board',
-            'outer ring road', 'bannerghatta road', 'old airport road'
-        ]
-        
-    def smart_rate_limiter(self):
-        """Intelligent rate limiting to maximize efficiency"""
-        now = time.time()
-        
-        # Reset daily counter at midnight
-        if datetime.now().hour == 0 and datetime.now().minute == 0:
-            self.api_calls_today = 0
-        
-        # Check if we need to wait
-        if now - self.last_api_call < 6:  # 10 calls per minute max
-            time.sleep(6 - (now - self.last_api_call))
-        
-        # Check daily limit
-        if self.api_calls_today >= self.daily_limit:
-            print("⚠️ Daily API limit reached. Switching to cached processing.")
-            return False
-        
-        self.last_api_call = time.time()
-        self.api_calls_today += 1
-        return True
-    
-    def intelligent_data_ingestion(self):
-        """Fetch and pre-filter high-signal data with detailed logging"""
-        print("🔍 Intelligent data ingestion starting...")
-        print("="*60)
-        
-        high_signal_posts = []
-        total_posts_scanned = 0
-        posts_by_subreddit = {}
-        
-        # Target high-activity Bengaluru subreddits
-        target_subreddits = ['bangalore', 'bengaluru', 'india']
-        
-        for subreddit_name in target_subreddits:
-            print(f"\n📡 Scanning r/{subreddit_name}...")
-            subreddit_posts = []
-            
-            try:
-                subreddit = self.reddit.subreddit(subreddit_name)
-                
-                # Get both hot and new posts for comprehensive coverage
-                post_sources = [
-                    ("HOT", subreddit.hot(limit=30)),
-                    ("NEW", subreddit.new(limit=20))
-                ]
-                
-                for source_type, post_source in post_sources:
-                    print(f"  🔥 Fetching {source_type} posts from r/{subreddit_name}...")
-                    
-                    for post in post_source:
-                        total_posts_scanned += 1
-                        
-                        # Pre-filter for Bengaluru relevance
-                        if self._is_high_signal_content(post):
-                            post_data = {
-                                'id': post.id,
-                                'title': post.title,
-                                'content': post.selftext,
-                                'score': post.score,
-                                'created_utc': post.created_utc,
-                                'subreddit': subreddit_name,
-                                'url': post.url,
-                                'num_comments': post.num_comments,
-                                'category_hint': self._quick_categorize(post.title + " " + post.selftext),
-                                'priority_score': self._calculate_priority(post),
-                                'timestamp': datetime.now().isoformat(),
-                                'source_type': source_type
-                            }
-                            
-                            # Print details about selected post
-                            print(f"    ✅ SELECTED: [{post_data['category_hint'].upper()}] {post.title[:50]}...")
-                            print(f"       📊 Score: {post.score} | Comments: {post.num_comments} | Priority: {post_data['priority_score']:.1f}")
-                            print(f"       🕒 Source: {source_type} from r/{subreddit_name}")
-                            
-                            high_signal_posts.append(post_data)
-                            subreddit_posts.append(post_data)
-                        else:
-                            # Optionally show rejected posts (comment out if too verbose)
-                            # print(f"    ❌ REJECTED: {post.title[:40]}...")
-                            pass
-                            
-            except Exception as e:
-                print(f"⚠️ Error fetching r/{subreddit_name}: {e}")
-            
-            posts_by_subreddit[subreddit_name] = len(subreddit_posts)
-            print(f"  📈 Found {len(subreddit_posts)} relevant posts in r/{subreddit_name}")
-        
-        # Sort by priority for intelligent processing
-        high_signal_posts.sort(key=lambda x: x['priority_score'], reverse=True)
-        
-        # Summary statistics
-        print(f"\n📊 INGESTION SUMMARY:")
-        print(f"  🔍 Total posts scanned: {total_posts_scanned}")
-        print(f"  ✅ High-signal posts found: {len(high_signal_posts)}")
-        print(f"  📈 Success rate: {(len(high_signal_posts)/total_posts_scanned)*100:.1f}%")
-        
-        print(f"\n📋 POSTS BY SUBREDDIT:")
-        for subreddit, count in posts_by_subreddit.items():
-            print(f"  r/{subreddit}: {count} posts")
-        
-        print(f"\n🎯 TOP 10 PRIORITY POSTS:")
-        for i, post in enumerate(high_signal_posts[:10]):
-            print(f"  {i+1}. [{post['category_hint'].upper()}] {post['title'][:50]}...")
-            print(f"     Priority: {post['priority_score']:.1f} | r/{post['subreddit']} | {post['source_type']}")
-        
-        return high_signal_posts[:50]  # Top 50 for efficiency
 
-    
-    def _is_high_signal_content(self, post) -> bool:
-        """Advanced signal detection with detailed logging"""
-        text = (post.title + " " + post.selftext).lower()
-        
-        # Check for Bengaluru mentions
-        bengaluru_mentioned = any(area in text for area in self.bengaluru_areas)
-        bengaluru_keywords = any(word in text for word in ['bengaluru', 'bangalore', 'blr'])
-        
-        # Check for actionable content categories
-        actionable_content = any(
-            any(keyword in text for keyword in keywords)
-            for keywords in self.bengaluru_signals.values()
-        )
-        
-        # Priority boost for recent, high-engagement posts
-        is_recent = (time.time() - post.created_utc) < 86400  # Last 24 hours
-        has_engagement = post.score > 5 or post.num_comments > 3
-        
-        # Detailed logging for selection criteria
-        location_match = bengaluru_mentioned or bengaluru_keywords
-        is_relevant = location_match and actionable_content and (is_recent or has_engagement)
-        
-        # Debug logging (uncomment to see all decision factors)
-        if is_relevant:
-            matched_areas = [area for area in self.bengaluru_areas if area in text]
-            matched_keywords = [word for word in ['bengaluru', 'bangalore', 'blr'] if word in text]
-            matched_signals = []
-            for category, keywords in self.bengaluru_signals.items():
-                if any(keyword in text for keyword in keywords):
-                    matched_signals.append(category)
-            
-            print(f"      🎯 Match reasons: Areas={matched_areas} | Keywords={matched_keywords} | Signals={matched_signals}")
-        
-        return is_relevant
+def retry_with_exponential_backoff(
+    max_retries=3,
+    initial_delay=5,
+    max_delay=60,
+    allowed_exceptions=(
+        google_exceptions.ResourceExhausted,
+        google_exceptions.ServiceUnavailable,
+        google_exceptions.DeadlineExceeded,
+        json.JSONDecodeError,
+    )
+):
+    """
+    Decorator for retrying a function with exponential backoff.
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            delay = initial_delay
+            for i in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except allowed_exceptions as e:
+                    if i == max_retries - 1:
+                        print(
+                            f"❌ Final attempt for {func.__name__} failed after {max_retries} retries.")
+                        raise e
 
-    
-    def _quick_categorize(self, text: str) -> str:
-        """Fast pre-categorization without API calls"""
-        text = text.lower()
-        
-        for category, keywords in self.bengaluru_signals.items():
-            if any(keyword in text for keyword in keywords):
-                return category
-        
-        return 'general'
-    
-    def _calculate_priority(self, post) -> float:
-        """Calculate processing priority for intelligent batching"""
-        score = 0
-        
-        # Engagement score
-        score += post.score * 0.1
-        score += post.num_comments * 0.2
-        
-        # Recency score
-        hours_old = (time.time() - post.created_utc) / 3600
-        if hours_old < 1:
-            score += 10
-        elif hours_old < 6:
-            score += 5
-        elif hours_old < 24:
-            score += 2
-        
-        # Urgency keywords
-        urgent_keywords = ['accident', 'emergency', 'blocked', 'stuck', 'help', 'urgent']
-        text = (post.title + " " + post.selftext).lower()
-        score += sum(5 for keyword in urgent_keywords if keyword in text)
-        
-        return score
-    
-    def hyper_efficient_synthesis(self, posts: List[Dict]) -> List[Dict]:
-        """Ultra-efficient batch processing with Gemini"""
-        if not posts:
-            return []
-        
-        print(f"🤖 Synthesizing {len(posts)} posts with Gemini...")
-        
-        # Group posts by category for batch processing
-        categorized_batches = {}
-        for post in posts:
-            category = post['category_hint']
-            if category not in categorized_batches:
-                categorized_batches[category] = []
-            categorized_batches[category].append(post)
-        
-        synthesized_events = []
-        
-        for category, category_posts in categorized_batches.items():
-            # Process in smart batches of 5 for optimal token usage
-            batches = [category_posts[i:i+5] for i in range(0, len(category_posts), 5)]
-            
-            for batch in batches:
-                if not self.smart_rate_limiter():
-                    break
-                
-                synthesized_batch = self._process_batch_with_gemini(batch, category)
-                synthesized_events.extend(synthesized_batch)
-        
-        return synthesized_events
-    
-    def _process_batch_with_gemini(self, posts: List[Dict], category: str) -> List[Dict]:
-        """Process a batch of posts with detailed logging"""
-        print(f"\n🤖 Processing {len(posts)} {category.upper()} posts with Gemini:")
-        print("-" * 40)
-        
-        for i, post in enumerate(posts):
-            print(f"  Batch Post {i+1}: {post['title'][:60]}...")
-            print(f"    📊 Score: {post['score']} | Priority: {post['priority_score']:.1f} | r/{post['subreddit']}")
-        
-        try:
-            # Create super-efficient prompt
-            prompt = f"""
-            BENGALURU CITY INTELLIGENCE AGENT
-            
-            Category: {category.upper()}
-            Analyze these {len(posts)} posts and create actionable city intelligence:
-            
-            """
-            
-            for i, post in enumerate(posts):
-                prompt += f"""
-            POST {i+1}:
-            Title: {post['title']}
-            Content: {post['content'][:300]}
-            Score: {post['score']} | Comments: {post['num_comments']}
-            
-            """
-            
-            prompt += f"""
-            FOR EACH POST, provide JSON output:
-            {{
-                "post_number": 1-{len(posts)},
-                "event_id": "unique_id",
-                "category": "{category}",
-                "severity": "low/medium/high/critical",
-                "summary": "One clear actionable sentence",
-                "location": "Extracted Bengaluru area/landmark",
-                "actionable_advice": "Specific citizen advice",
-                "urgency_score": 1-10,
-                "affects_traffic": true/false,
-                "estimated_duration": "time estimate if applicable"
-            }}
-            
-            Output as JSON array only. No other text.
-            """
-            
-            print(f"  🧠 Sending batch to Gemini for analysis...")
-            response = self.model.generate_content(prompt)
-            
-            # Parse and enhance the response
-            try:
-                gemini_analysis = json.loads(response.text.strip())
-                enhanced_events = []
-                
-                print(f"  ✅ Gemini processed {len(gemini_analysis)} events:")
-                
-                for i, analysis in enumerate(gemini_analysis):
-                    if i < len(posts):  # Safety check
-                        enhanced_event = {
-                            'id': self._generate_event_id(posts[i]),
-                            'original_post_id': posts[i]['id'],
-                            'original_title': posts[i]['title'],
-                            'source_subreddit': posts[i]['subreddit'],
-                            'category': analysis.get('category', category),
-                            'severity': analysis.get('severity', 'medium'),
-                            'summary': analysis.get('summary', posts[i]['title']),
-                            'location': analysis.get('location', 'Bengaluru'),
-                            'actionable_advice': analysis.get('actionable_advice'),
-                            'urgency_score': analysis.get('urgency_score', 5),
-                            'affects_traffic': analysis.get('affects_traffic', False),
-                            'estimated_duration': analysis.get('estimated_duration'),
-                            'source_score': posts[i]['score'],
-                            'source_comments': posts[i]['num_comments'],
-                            'timestamp': datetime.now().isoformat(),
-                            'processed_by': 'gemini-1.5-flash'
-                        }
-                        
-                        # Show transformation
-                        print(f"    Event {i+1}: {posts[i]['title'][:40]}...")
-                        print(f"    → {enhanced_event['summary']}")
-                        print(f"      Severity: {enhanced_event['severity']} | Urgency: {enhanced_event['urgency_score']}/10")
-                        
-                        enhanced_events.append(enhanced_event)
-                
-                return enhanced_events
-                
-            except json.JSONDecodeError:
-                print(f"  ⚠️ JSON parsing error for {category} batch - using fallback")
-                return self._fallback_processing(posts, category)
-                
-        except Exception as e:
-            print(f"  ⚠️ Gemini API error: {e} - using fallback")
-            return self._fallback_processing(posts, category)
+                    jitter = random.uniform(0, delay * 0.1)
+                    wait_time = min(delay + jitter, max_delay)
 
-    
-    def _fallback_processing(self, posts: List[Dict], category: str) -> List[Dict]:
-        """Fallback processing when API fails"""
-        fallback_events = []
-        
-        for post in posts:
-            event = {
-                'id': self._generate_event_id(post),
-                'original_post_id': post['id'],
-                'category': category,
-                'severity': 'medium',
-                'summary': post['title'][:100],
-                'location': 'Bengaluru',
-                'actionable_advice': 'Check local updates',
-                'urgency_score': post['priority_score'] // 2,
-                'affects_traffic': category == 'traffic',
-                'source_score': post['score'],
-                'timestamp': datetime.now().isoformat(),
-                'processed_by': 'fallback'
-            }
-            fallback_events.append(event)
-        
-        return fallback_events
-    
-    def _generate_event_id(self, post: Dict) -> str:
-        """Generate unique event ID"""
-        unique_string = f"{post['id']}{post['created_utc']}{post['title'][:20]}"
-        return hashlib.md5(unique_string.encode()).hexdigest()[:12]
-    
-    def real_time_storage(self, events: List[Dict]):
-        """Store processed events in Firebase with intelligent indexing"""
-        if not events:
-            return
-        
-        print(f"💾 Storing {len(events)} events to Firebase...")
-        
-        batch = self.db.batch()
-        current_time = datetime.now()
-        
-        for event in events:
-            # Create document reference
-            doc_ref = self.db.collection('live_events').document(event['id'])
-            
-            # Add metadata for efficient querying
-            event.update({
-                'created_at': current_time,
-                'expires_at': current_time + timedelta(hours=24),  # Auto-cleanup
-                'indexed_location': event['location'].lower(),
-                'searchable_text': f"{event['summary']} {event['location']} {event['category']}".lower()
-            })
-            
-            batch.set(doc_ref, event)
-        
-        # Execute batch write for efficiency
-        batch.commit()
-        print("✅ Batch storage completed")
-    
-    def run_super_efficient_cycle(self) -> List[Dict]:
-        """Execute one complete hyper-efficient fusion cycle"""
-        print("🚀 SUPER-EFFICIENT DATA FUSION CYCLE STARTING...")
-        start_time = time.time()
-        
-        # Phase 1: Intelligent data ingestion
-        raw_posts = self.intelligent_data_ingestion()
-        
-        # Phase 2: Hyper-efficient synthesis
-        synthesized_events = self.hyper_efficient_synthesis(raw_posts)
-        
-        # Phase 3: Real-time storage
-        self.real_time_storage(synthesized_events)
-        
-        # Phase 4: Generate city pulse summary
-        pulse_summary = self.generate_city_pulse_summary(synthesized_events)
-        
-        execution_time = time.time() - start_time
-        
-        print(f"⚡ CYCLE COMPLETE in {execution_time:.2f}s")
-        print(f"📊 Processed {len(raw_posts)} posts → {len(synthesized_events)} events")
-        print(f"🎯 City Pulse: {pulse_summary}")
-        
-        return synthesized_events
-    
-    def generate_city_pulse_summary(self, events: List[Dict]) -> str:
-        """Generate intelligent city summary"""
-        if not events:
-            return "City pulse: Quiet period"
-        
-        # Quick analysis without API calls
-        categories = {}
-        high_urgency = 0
-        traffic_affected = 0
-        
-        for event in events:
-            cat = event['category']
-            categories[cat] = categories.get(cat, 0) + 1
-            if event['urgency_score'] >= 7:
-                high_urgency += 1
-            if event.get('affects_traffic'):
-                traffic_affected += 1
-        
-        top_category = max(categories.items(), key=lambda x: x[1])[0]
-        
-        pulse = f"{len(events)} active events. "
-        pulse += f"Primary concern: {top_category}. "
-        
-        if high_urgency > 0:
-            pulse += f"{high_urgency} urgent situations. "
-        if traffic_affected > 0:
-            pulse += f"{traffic_affected} traffic-affecting events."
-        
-        return pulse
+                    print(
+                        f"⚠️ {func.__name__} failed ({type(e).__name__}). Retrying in {wait_time:.2f}s... (Attempt {i+1}/{max_retries})")
+                    time.sleep(wait_time)
+                    delay *= 2
+        return wrapper
+    return decorator
+
+
+def _extract_json_from_response(text: str) -> Optional[str]:
+    match = re.search(r'``````', text, re.DOTALL)
+    if match:
+        return match.group(1)
+    match = re.search(r'(\[.*?\]|\{.*?\})', text, re.DOTALL)
+    if match:
+        return match.group(1)
+    return None
+
+
+class FirebaseClient:
+
+         def __init__(self):
+                 if not firebase_admin._apps:
+
+
+                        cred = credentials.Certificate('config/firebase-service-account.json')
+                        firebase_admin.initialize_app(cred)
+                self.db = firestore.client()
+
+
+class FetchRedditPosts(Tool):
+
+         def __init__(self, name="FetchRedditPosts"):
+
+
+                super().__init__(name=name)
+                # Initialize PRAW Reddit client
+                self.reddit = praw.Reddit(
+    client_id=os.getenv('REDDIT_CLIENT_ID'),
+                        client_secret=os.getenv('REDDIT_CLIENT_SECRET'),
+                        user_agent=os.getenv('REDDIT_USER_AGENT')
+               )
+                self.bengaluru_signals = {
+    'traffic': ['traffic', 'jam', 'road', 'signal', 'blocked', 'accident', 'stuck'],
+                        'infrastructure': ['pothole', 'construction', 'metro', 'water', 'power cut', 'outage'],
+                        'weather': ['rain', 'flood', 'waterlogged', 'storm', 'weather'],
+                        'events': ['protest', 'rally', 'festival', 'event', 'crowd', 'gathering'],
+                        'civic': ['garbage', 'complaint', 'bbmp', 'civic', 'municipal']
+               }
+
+
+                self.bengaluru_areas = [
+    'koramangala', 'indiranagar', 'whitefield', 'electronic city', 'hsr layout',
+    'jayanagar', 'malleshwaram', 'rajajinagar', 'hebbal', 'sarjapur',
+    'marathahalli', 'btm layout', 'mg road', 'brigade road', 'commercial street',
+    'silk board', 'outer ring road', 'bannerghatta road', 'old airport road'
+]
+
+         def _is_high_signal_content(self, post) -> bool:
+                text = (post.title + " " + post.selftext).lower()
+                bengaluru_mentioned = any(area in text for area in self.bengaluru_areas)
+                bengaluru_keywords = any(word in text for word in ['bengaluru', 'bangalore', 'blr'])
+                actionable_content = any(
+    any(keyword in text for keyword in keywords) for keywords in self.bengaluru_signals.values()
+               )
+                is_recent = (time.time() - post.created_utc) < 86400
+                has_engagement = post.score > 5 or post.num_comments > 3
+                 return (bengaluru_mentioned or bengaluru_keywords) and actionable_content and (is_recent or has_engagement)
+
+         def _quick_categorize(self, text: str) -> str:
+                text = text.lower()
+                 for category, keywords in self.bengaluru_signals.items():
+                         if any(keyword in text for keyword in keywords):
+                                 return category
+                 return 'general'
+
+         def _calculate_priority(self, post) -> float:
+                score = post.score * 0.1 + post.num_comments * 0.2
+                hours_old = (time.time() - post.created_utc) / 3600
+                 if hours_old < 1:
+                        score += 10
+                 elif hours_old < 6:
+                        score += 5
+                 elif hours_old < 24:
+                        score += 2
+                urgent_keywords = ['accident', 'emergency', 'blocked', 'stuck', 'help', 'urgent']
+                text = (post.title + " " + post.selftext).lower()
+                score += sum(5 for keyword in urgent_keywords if keyword in text)
+                 return score
+
+         def invoke(self, context: Context, inputs: dict) -> dict:
+                 try:
+                         print("🔍 Fetching Reddit posts...")
+                        high_signal_posts = []
+                        target_subreddits = ['bangalore', 'bengaluru', 'india']
+                         for subreddit_name in target_subreddits:
+                                subreddit = self.reddit.subreddit(subreddit_name)
+                                post_sources = [("HOT", subreddit.hot(limit=30)), ("NEW", subreddit.new(limit=20))]
+                                 for source_type, post_source in post_sources:
+                                         for post in post_source:
+                                                 if self._is_high_signal_content(post):
+                                                        post_data = {
+    'id': post.id, 'title': post.title, 'content': post.selftext,
+    'score': post.score, 'created_utc': post.created_utc,
+    'subreddit': subreddit_name, 'url': post.url, 'num_comments': post.num_comments,
+    'category_hint': self._quick_categorize(f"{post.title} {post.selftext}"),
+                                                                'priority_score': self._calculate_priority(post), 'source_type': source_type,
+                                                                'timestamp': datetime.now().isoformat(),
+                                                       }
+                                                        high_signal_posts.append(post_data)
+
+
+                        # Sort descending priority and limit
+                        high_signal_posts.sort(key=lambda x: x['priority_score'], reverse=True)
+                         print(f"✅ Fetched {len(high_signal_posts[:50])} high-signal Reddit posts")
+                         return {'posts': high_signal_posts[:50]}
+                 except Exception as e:
+                         print(f"⚠️ Exception in FetchRedditPosts: {e}")
+                         return {'posts': []}
+
+
+class FilterPostsWithGemini(Tool):
+
+         def __init__(self, name="FilterPostsWithGemini"):
+
+
+                super().__init__(name=name)
+                genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
+                self.filter_model = genai.GenerativeModel('gemini-1.5-flash')
+
+
+        @retry_with_exponential_backoff()
+         def invoke(self, context: Context, inputs: dict) -> dict:
+                posts = inputs.get('posts', [])
+                preferences = inputs.get('preferences', {})
+                 if not posts:
+                         return {'filtered_posts': []}
+                 print(f"🤖 Filtering {len(posts)} posts with Gemini...")
+
+
+                prompt = f"""
+        You are a JSON filtering agent. Your task is to filter a list of Reddit posts based on user preferences.
+        Analyze the user preferences and the list of posts provided.
+        Return a valid JSON array containing only the post objects that match the user's preferences.
+        The structure of the returned post objects must be identical to the input post objects.
+
+
+        USER PREFERENCES:
+        {json.dumps(preferences, indent=2)}
+
+
+        REDDIT POSTS:
+        {json.dumps(posts, indent=2)}
+
+
+        IMPORTANT:
+        - Your entire response must be ONLY the JSON array.
+        - Do not include any explanatory text, markdown, or any characters before or after the JSON array.
+        - If no posts match the preferences, you MUST return an empty JSON array: [].
+        """
+                 if not context.agent.smart_rate_limiter():
+                         raise Exception("Rate limit hit")
+                response = self.filter_model.generate_content(prompt)
+                json_text = _extract_json_from_response(response.text)
+                 if not json_text:
+                         print("⚠️ No valid JSON found in the model's response.")
+                         return {'filtered_posts': []}
+                filtered_posts = json.loads(json_text)
+                 print(f"✅ Gemini filter selected {len(filtered_posts)} posts")
+                 return {'filtered_posts': filtered_posts}
+
+
+class SynthesizeEventsWithGemini(Tool):
+
+         def __init__(self, name="SynthesizeEventsWithGemini"):
+
+
+                super().__init__(name=name)
+                genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
+                self.inference_model = genai.GenerativeModel('gemini-1.5-flash')
+
+
+        @retry_with_exponential_backoff()
+         def invoke(self, context: Context, inputs: dict) -> dict:
+                posts = inputs.get('filtered_posts', [])
+                preferences = inputs.get('preferences', {})
+                 if not posts:
+                         return {'events': []}
+                 print(f"🤖 Synthesizing {len(posts)} posts into events with Gemini...")
+                preferred_category = preferences.get('categories', ['general'])[0]
+                categorized_batches = {preferred_category: posts} if posts else {}
+
+
+                all_events = []
+                 for category, category_posts in categorized_batches.items():
+                        batches = [category_posts[i:i+5] for i in range(0, len(category_posts), 5)]
+                         for batch in batches:
+                                 try:
+                                        prompt = f"""
+                    BENGALURU CITY INTELLIGENCE AGENT - INFERENCE
+                    Category: {category.upper()}
+                    Analyze these {len(batch)} posts and create actionable city intelligence in a JSON array.
+                    """
+                                         for i, post in enumerate(batch):
+                                                prompt += f"POST {i+1}: Title: {post['title']}, Content: {post['content'][:300]}"
+                                        prompt += """
+                    FOR EACH POST, provide JSON output:
+                    {"post_number": int, "event_id": "unique_id", "category": "category", "severity": "low/medium/high/critical", "summary": "actionable sentence", "location": "Bengaluru area", "actionable_advice": "citizen advice", "urgency_score": 1-10, "affects_traffic": bool, "estimated_duration": "time estimate"}
+                    """
+                                         if not context.agent.smart_rate_limiter():
+                                                 raise Exception("Rate limit hit")
+                                        response = self.inference_model.generate_content(prompt)
+                                        json_text = _extract_json_from_response(response.text)
+                                         if not json_text:
+                                                 print("⚠️ No valid JSON found in the model's response for synthesis.")
+                                                # Fallback to simple titles as events
+                                                 for post in batch:
+                                                        all_events.append({
+    'id': hashlib.md5(post['id'].encode()).hexdigest()[:12],
+                                                                'summary': post['title'],
+                                                                'category': category,
+                                                                'severity': 'medium',
+                                                                'location': 'Bengaluru',
+                                                                'actionable_advice': 'Check local updates',
+                                                                'urgency_score': 5,
+                                                                'affects_traffic': category == 'traffic',
+                                                                'timestamp': datetime.now().isoformat(),
+                                                       })
+                                                 continue
+                                        gemini_analysis = json.loads(json_text)
+                                         for i, analysis in enumerate(gemini_analysis):
+                                                 if i < len(batch):
+                                                        event = {
+    'id': hashlib.md5(batch[i]['id'].encode()).hexdigest()[:12],
+                                                                'original_post_id': batch[i]['id'],
+                                                                'original_title': batch[i]['title'],
+                                                                'source_subreddit': batch[i]['subreddit'],
+                                                                'category': analysis.get('category', category),
+                                                                'severity': analysis.get('severity', 'medium'),
+                                                                'summary': analysis.get('summary', batch[i]['title']),
+                                                                'location': analysis.get('location', 'Bengaluru'),
+                                                                'actionable_advice': analysis.get('actionable_advice'),
+                                                                'urgency_score': analysis.get('urgency_score', 5),
+                                                                'affects_traffic': analysis.get('affects_traffic', False),
+                                                                'estimated_duration': analysis.get('estimated_duration'),
+                                                                'timestamp': datetime.now().isoformat(),
+                                                                'processed_by': 'inference-model',
+                                                       }
+                                                        all_events.append(event)
+                                 except Exception as e:
+                                         print(f"⚠️ Synthesis error on batch: {e}, falling back.")
+                                         for post in batch:
+                                                all_events.append({
+    'id': hashlib.md5(post['id'].encode()).hexdigest()[:12],
+                                                        'summary': post['title'],
+                                                        'category': category,
+                                                        'severity': 'medium',
+                                                        'location': 'Bengaluru',
+                                                        'actionable_advice': 'Check local updates',
+                                                        'urgency_score': 4,
+                                                        'affects_traffic': category == 'traffic',
+                                                        'timestamp': datetime.now().isoformat(),
+                                                        'processed_by': 'fallback',
+                                               })
+                 print(f"✅ Synthesized {len(all_events)} events")
+                 return {'events': all_events}
+
+
+class StoreEventsToFirestore(Tool):
+
+         def __init__(self, name="StoreEventsToFirestore"):
+
+
+                super().__init__(name=name)
+                self.firebase_client = FirebaseClient()
+
+         def invoke(self, context: Context, inputs: dict) -> dict:
+                events = inputs.get('events', [])
+                 if not events:
+                         print("⚠️ No events to store")
+                         return {'result': 'no events'}
+                 print(f"💾 Storing {len(events)} events to Firestore...")
+                batch = self.firebase_client.db.batch()
+                current_time = datetime.now()
+                 for event in events:
+                        doc_ref = self.firebase_client.db.collection('live_events').document(event['id'])
+                        event.update({
+    'created_at': current_time,
+    'expires_at': current_time + timedelta(hours=24),
+                                'indexed_location': event['location'].lower(),
+                                'searchable_text': f"{event['summary']} {event['location']} {event['category']}".lower()
+                       })
+                        batch.set(doc_ref, event)
+                batch.commit()
+                 print("✅ Batch storage completed")
+                 return {'result': 'success'}
+
+
+# Compose all tools into the workflow
+fusion_workflow = Workflow(
+    steps=[
+        FetchRedditPosts(),
+                FilterPostsWithGemini(),
+                SynthesizeEventsWithGemini(),
+                StoreEventsToFirestore()
+    ]
+)
+
+
+# Define your Agent which runs the workflow
+class CityPulseAgent(Agent):
+
+         def __init__(self):
+
+
+                super().__init__(workflow=fusion_workflow, name="BengaluruLivePulseAgent")
+
+         def smart_rate_limiter(self):
+                    # Provide rate limiter support to tools (copied from your agent)
+                 if not hasattr(self, '_last_api_call'):
+                        self._last_api_call = 0
+                        self._api_calls_today = 0
+                        self._daily_limit = 250
+                now = time.time()
+                 if datetime.now().hour == 0 and datetime.now().minute == 0:
+                        self._api_calls_today = 0
+                 if now - self._last_api_call < 6:
+                        time.sleep(6 - (now - self._last_api_call))
+                 if self._api_calls_today >= self._daily_limit:
+                         print("⚠️ Daily API limit reached.")
+                         return False
+                self._last_api_call = time.time()
+                self._api_calls_today += 1
+                 return True
+
+
+if __name__ == "__main__":
+        agent = CityPulseAgent()
+        inputs = {
+    'preferences': {
+        'categories': ['traffic', 'infrastructure', 'weather', 'events', 'civic']
+    }
+       }
+        # Add the agent reference to context for smart_rate_limiter calls
+        Context.agent = agent
+        result = agent.run(inputs)
+         print("🏆 Agent run result:")
+        print(json.dumps(result, indent=2))
